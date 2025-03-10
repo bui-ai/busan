@@ -1,0 +1,464 @@
+import streamlit as st
+from dotenv import load_dotenv
+from langchain.schema import HumanMessage, AIMessage, SystemMessage
+from langchain_ollama import ChatOllama
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import Chroma
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.document_loaders import PyPDFLoader
+from langchain.prompts import PromptTemplate
+from langchain.schema.runnable import RunnablePassthrough
+from langchain.schema.output_parser import StrOutputParser
+import os
+import tempfile
+import pdfplumber
+import pandas as pd
+from fuzzywuzzy import process
+import pickle
+import glob
+import json
+
+# Load environment variables from a .env file
+load_dotenv()
+
+# 💾 앱 데이터 저장 경로 설정 (로컬)
+DATA_DIR = os.path.join(os.path.expanduser("~"), "chatbot_data")
+TABLES_DIR = os.path.join(DATA_DIR, "tables")
+CHROMA_DIR = os.path.join(DATA_DIR, "chroma_db")
+
+# 💾 앱 시작 시 필요한 디렉토리 생성
+def create_data_directories():
+    for directory in [DATA_DIR, TABLES_DIR, CHROMA_DIR]:
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+
+def configure_page():
+    st.set_page_config(
+        page_title="도시혁신균형실 Chat-Bot",
+        page_icon="🤖",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    st.title("🤖 도시혁신균형실 Chat-Bot 📝")
+    with st.expander("Check State"):
+        st.write(st.session_state)
+
+def clean_column_names(df):
+    """컬럼명이 중복되거나 None일 경우 자동으로 수정"""
+    new_columns = []
+    column_counts = {}
+
+    for col in df.columns:
+        if col is None or col == "":  # 빈 컬럼명 처리
+            col = "Unnamed"
+
+        if col in column_counts:
+            column_counts[col] += 1
+            new_col = f"{col}_{column_counts[col]}"  # 중복 방지 (예: "위원회명_1")
+        else:
+            column_counts[col] = 0
+            new_col = col
+
+        new_columns.append(new_col)
+
+    df.columns = new_columns
+    return df
+
+def extract_tables_from_pdf(uploaded_file):
+    """PDF에서 표 데이터를 추출하여 개별적인 pandas DataFrame으로 저장"""
+    try:
+        tables = []
+        with pdfplumber.open(uploaded_file) as pdf:
+            for page in pdf.pages:
+                extracted_tables = page.extract_tables()
+                for table in extracted_tables:
+                    if table:  # 빈 테이블 제외
+                        df = pd.DataFrame(table)
+
+                        # 🔹 첫 번째 행을 컬럼명으로 설정
+                        df.columns = df.iloc[0]  
+                        df = df[1:].reset_index(drop=True)  # 첫 번째 행 삭제 후 재정렬
+
+                        # 🔹 첫 번째 열을 인덱스로 설정 (행 이름 자동 정리)
+                        df = df.set_index(df.columns[0])
+
+                        df = clean_column_names(df)  # 중복 컬럼명 처리
+                        tables.append(df)
+
+        return tables if tables else None
+    except Exception as e:
+        st.error(f"❌ 표 데이터 추출 오류: {e}")
+        return None
+
+def search_in_tables(tables, query):
+    """각 표에서 사용자의 질문과 관련된 데이터를 검색"""
+    matching_results = []
+
+    if tables:
+        for idx, df in enumerate(tables):
+            # 🔹 가장 유사한 컬럼 찾기 (예: "하루 이용량" → "1일 통행량 (대)")
+            best_match_col, score_col = process.extractOne(query, df.columns) if not df.columns.empty else (None, 0)
+
+            # 🔹 가장 유사한 행 찾기 (예: "광안대교" → "광안대로")
+            best_match_row, score_row = process.extractOne(query, df.index) if not df.index.empty else (None, 0)
+
+            # 🔹 검색 조건 만족하면 결과 반환
+            if score_col > 70 and score_row > 70:
+                result_value = df.loc[best_match_row, best_match_col]
+                result_df = pd.DataFrame({"항목": [f"{best_match_row}의 {best_match_col}"], "값": [result_value]})
+                matching_results.append((idx, result_df))
+
+    return matching_results  # 검색된 표 리스트 반환
+
+def search_in_dataframe(df, query):
+    """ 사용자의 질문과 관련된 데이터를 pandas DataFrame에서 검색 """
+    if df is not None and not df.empty:
+        results = df[df.apply(lambda row: row.astype(str).str.contains(query, case=False, na=False).any(), axis=1)]
+        return results
+    return pd.DataFrame()  # 관련 데이터가 없을 경우 빈 데이터프레임 반환
+
+# 💾 표 데이터 저장 함수
+def save_tables(tables, filename):
+    """표 데이터를 CSV 파일로 저장"""
+    if not tables:
+        return False
+    
+    tables_info = []
+    for i, df in enumerate(tables):
+        table_path = os.path.join(TABLES_DIR, f"{filename}_table_{i}.csv")
+        df.to_csv(table_path)
+        tables_info.append(table_path)
+    
+    # 테이블 메타데이터 저장 (파일명과 테이블 정보)
+    metadata_path = os.path.join(TABLES_DIR, f"{filename}_metadata.json")
+    with open(metadata_path, 'w') as f:
+        json.dump({
+            "filename": filename,
+            "tables": tables_info,
+            "count": len(tables)
+        }, f)
+    
+    return True
+
+# 💾 저장된 표 데이터 로드 함수
+def load_saved_tables():
+    """저장된 모든 표 데이터를 로드"""
+    tables = []
+    metadata_files = glob.glob(os.path.join(TABLES_DIR, "*_metadata.json"))
+    
+    if not metadata_files:
+        return None
+    
+    for metadata_file in metadata_files:
+        with open(metadata_file, 'r') as f:
+            metadata = json.load(f)
+            
+        for table_path in metadata["tables"]:
+            if os.path.exists(table_path):
+                try:
+                    df = pd.read_csv(table_path, index_col=0)
+                    tables.append(df)
+                except Exception as e:
+                    st.warning(f"⚠️ 테이블 로드 중 오류: {e}")
+    
+    return tables if tables else None
+
+# 💾 벡터 저장소 로드 함수
+def load_vector_store(embeddings):
+    """저장된 Chroma 벡터 데이터베이스를 로드"""
+    if os.path.exists(CHROMA_DIR) and os.listdir(CHROMA_DIR):  # 디렉토리가 존재하고 비어있지 않은 경우
+        try:
+            vector_store = Chroma(
+                persist_directory=CHROMA_DIR,
+                embedding_function=embeddings
+            )
+            return vector_store
+        except Exception as e:
+            st.error(f"❌ 벡터 DB 로드 오류: {e}")
+            return None
+    return None
+
+def handle_sidebar():
+    st.sidebar.header("🔧 설정")
+
+    selected_model = st.sidebar.selectbox(
+        "💡 사용할 모델 선택", ("EXAONE-3.5-2.4B-Instruct", "EXAONE-3.5-7.8B-Instruct")
+    )
+    st.session_state.model = selected_model
+
+    st.sidebar.divider()
+
+    k_value = st.sidebar.slider("🔍 검색할 문서 개수 (k)", min_value=1, max_value=10, value=5)
+    lambda_mult_value = st.sidebar.slider("🎚️ MMR Lambda (0: 다양성 ↑, 1: 유사성 ↑)", 
+                                          min_value=0.0, max_value=1.0, value=0.5, step=0.1)
+
+    st.sidebar.divider()
+
+    # 기존 데이터 상태 표시
+    has_existing_data = False
+    if os.path.exists(CHROMA_DIR) and os.listdir(CHROMA_DIR):
+        st.sidebar.success("✅ 기존 벡터 DB가 로드되었습니다.")
+        has_existing_data = True
+    
+    saved_tables = glob.glob(os.path.join(TABLES_DIR, "*_metadata.json"))
+    if saved_tables:
+        st.sidebar.success(f"✅ {len(saved_tables)}개의 기존 표 데이터셋이 로드되었습니다.")
+        has_existing_data = True
+
+    if not has_existing_data:
+        st.sidebar.warning("⚠️ 저장된 데이터가 없습니다. PDF를 업로드하여 데이터를 생성하세요.")
+
+    # PDF 업로드 섹션
+    uploaded_file = st.sidebar.file_uploader("📂 PDF 업로드", type=["pdf"])
+    if uploaded_file:
+        file_name = os.path.splitext(uploaded_file.name)[0]  # 확장자 제외한 파일명
+        
+        with st.spinner("📖 PDF 처리 중..."):
+            try:
+                documents = load_pdf(uploaded_file)
+                texts = split_text(documents)
+                embeddings = get_embeddings()
+                
+                # 벡터 스토어 생성 및 저장
+                vector_store = Chroma.from_documents(
+                    documents=texts,
+                    embedding=embeddings,
+                    persist_directory=CHROMA_DIR
+                )
+                vector_store.persist()  # 디스크에 저장
+                st.session_state.vector_store = vector_store
+
+                # 표 데이터 추출 및 저장
+                tables = extract_tables_from_pdf(uploaded_file)
+                if tables:
+                    st.session_state.tables = tables
+                    # 표 데이터 저장
+                    saved = save_tables(tables, file_name)
+                    if saved:
+                        st.success(f"✅ {len(tables)}개의 표 데이터가 저장되었습니다!")
+
+                st.success("✅ PDF 처리 및 벡터 DB에 저장 완료!")
+            except Exception as e:
+                st.error(f"❌ PDF 처리 중 오류 발생: {e}")
+
+    st.sidebar.divider()
+
+    # 데이터 관리 섹션
+    st.sidebar.subheader("📊 데이터 관리")
+    if st.sidebar.button("🔄 기존 데이터 로드"):
+        with st.spinner("🔄 저장된 데이터 로드 중..."):
+            # 벡터 DB 로드
+            embeddings = get_embeddings()
+            vector_store = load_vector_store(embeddings)
+            if vector_store:
+                st.session_state.vector_store = vector_store
+                st.sidebar.success("✅ 벡터 DB 로드 완료!")
+            
+            # 표 데이터 로드
+            tables = load_saved_tables()
+            if tables:
+                st.session_state.tables = tables
+                st.sidebar.success(f"✅ {len(tables)}개의 표 데이터 로드 완료!")
+
+    # 데이터 삭제 옵션
+    if st.sidebar.button("⚠️ 모든 저장 데이터 삭제"):
+        try:
+            # 벡터 DB 파일 삭제
+            for file in glob.glob(os.path.join(CHROMA_DIR, "*")):
+                os.remove(file)
+            
+            # 표 데이터 파일 삭제
+            for file in glob.glob(os.path.join(TABLES_DIR, "*")):
+                os.remove(file)
+                
+            st.sidebar.success("✅ 모든 저장 데이터가 삭제되었습니다.")
+            st.experimental_rerun()  # 앱 재시작
+        except Exception as e:
+            st.sidebar.error(f"❌ 데이터 삭제 중 오류 발생: {e}")
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 모델 정보")
+    st.sidebar.write(f"🛠 현재 모델: {selected_model}")
+
+    return selected_model, k_value, lambda_mult_value
+
+@st.cache_resource
+def get_chat_model(model_name):
+    return ChatOllama(model=model_name, streaming=True, temperature=0)
+
+@st.cache_resource
+def get_embeddings():
+    return HuggingFaceEmbeddings(model_name="snunlp/KR-SBERT-V40K-klueNLI-augSTS",
+                                 model_kwargs={'device': 'cpu'},
+                                 encode_kwargs={'normalize_embeddings': True})
+
+def load_pdf(uploaded_file):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+        tmp_file.write(uploaded_file.read())
+        tmp_file_path = tmp_file.name
+    loader = PyPDFLoader(tmp_file_path)
+    documents = loader.load()
+    os.unlink(tmp_file_path)
+    return documents
+
+def split_text(documents):
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=250)
+    texts = text_splitter.split_documents(documents)
+    return texts
+
+def handle_user_input(rag_chain, retriever, k_value):
+    if prompt := st.chat_input("📝 질문을 입력하세요"):
+        st.session_state.messages.append(HumanMessage(content=prompt))
+        with st.chat_message("user"):
+            st.write(prompt)
+
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            full_response = ""
+            try:
+                retrieved_docs = retriever.get_relevant_documents(prompt)
+
+                # 🔍 문서 검색 결과 중복 제거
+                unique_docs = []
+                seen_texts = set()
+                for doc in retrieved_docs:
+                    if doc.page_content not in seen_texts:
+                        unique_docs.append(doc)
+                        seen_texts.add(doc.page_content)
+
+                # 🔍 검색된 문서가 부족하면 확장 검색 실행
+                if len(unique_docs) < k_value:
+                    st.warning("🔍 관련 문서가 부족합니다. 추가 검색을 수행합니다...")
+                    all_docs = retriever.vectorstore.similarity_search(prompt, k=k_value * 3)
+
+                    for doc in all_docs:
+                        if doc.page_content not in seen_texts:
+                            unique_docs.append(doc)
+                            seen_texts.add(doc.page_content)
+                        if len(unique_docs) >= k_value:
+                            break  # k_value 개수만큼만 유지
+
+                # 📊 표 데이터 검색
+                matching_tables = None
+                if "tables" in st.session_state:
+                    matching_tables = search_in_tables(st.session_state.tables, prompt)
+
+                # 📄 검색된 문서 보기
+                with st.expander("📄 검색된 문서 보기"):
+                    if unique_docs:
+                        for idx, doc in enumerate(unique_docs):
+                            st.markdown(f"**📄 문서 {idx+1}:**")
+                            st.write(f"📌 **메타데이터:** {doc.metadata}")
+                            st.write(f"🔹 {doc.page_content[:500]}...")
+                    else:
+                        st.write("❌ 검색된 문서가 없습니다.")
+
+                # 📊 검색된 표 데이터 보기
+                with st.expander("📊 검색된 표 데이터 보기"):
+                    if matching_tables:
+                        for idx, df in matching_tables:
+                            st.markdown(f"**📊 표 {idx+1}:**")
+                            st.dataframe(df)
+                    else:
+                        st.write("🔍 관련된 표 데이터를 찾지 못했습니다.")
+
+                # 🔥 RAG 컨텍스트 생성 (검색된 문서 + 표 데이터 포함)
+                combined_context = "\n\n".join([
+                    f"📄 문서 {idx+1}:\n{doc.page_content}" for idx, doc in enumerate(unique_docs)
+                ])
+                if matching_tables:
+                    for idx, df in matching_tables:
+                        combined_context += f"\n\n📊 표 {idx+1}:\n{df.to_string(index=False)}"
+
+                enhanced_prompt = f"""
+                You are an assistant for answering questions based on the following documents and tables.
+                Make sure to include information from all relevant sources in your answer.
+
+                Question: {prompt}
+                Context: {combined_context}
+                Answer:
+                """
+
+                response = rag_chain.invoke({"question": prompt, "context": enhanced_prompt})
+                full_response = response
+                message_placeholder.markdown(full_response)
+                st.session_state.messages.append(AIMessage(content=full_response))
+
+            except Exception as e:
+                message_placeholder.markdown("❌ 응답 생성 중 오류 발생")
+                st.error(f"🚨 오류: {e}")
+
+
+def display_extracted_tables():
+    """각 표를 개별적으로 UI에서 확인할 수 있도록 표시"""
+    if "tables" in st.session_state and st.session_state.tables:
+        st.subheader("📊 추출된 표 데이터 미리보기")
+        for idx, df in enumerate(st.session_state.tables):
+            with st.expander(f"📊 표 {idx+1} 미리보기"):
+                st.dataframe(df)
+    else:
+        st.write("🔍 현재 추출된 표 데이터가 없습니다.")
+
+def main():
+    # 데이터 디렉토리 생성
+    create_data_directories()
+    
+    configure_page()
+    selected_model, k_value, lambda_mult_value = handle_sidebar()
+    chat_model = get_chat_model(selected_model)
+
+    # 📊 표 데이터 미리보기 추가
+    display_extracted_tables()
+
+    if "messages" not in st.session_state:
+        st.session_state.messages = [SystemMessage(content="🤖 AI 챗봇")]
+
+    # 벡터 스토어가 세션에 없으면 로드 시도
+    if "vector_store" not in st.session_state:
+        embeddings = get_embeddings()
+        vector_store = load_vector_store(embeddings)
+        if vector_store:
+            st.session_state.vector_store = vector_store
+    
+    # 표 데이터가 세션에 없으면 로드 시도
+    if "tables" not in st.session_state:
+        tables = load_saved_tables()
+        if tables:
+            st.session_state.tables = tables
+
+    # 벡터 스토어가 있으면 RAG 체인 준비 및 질문 처리
+    if "vector_store" in st.session_state:
+        retriever = st.session_state.vector_store.as_retriever(
+            search_type="mmr", search_kwargs={"k": k_value, "lambda_mult": lambda_mult_value}
+        )
+
+        prompt = PromptTemplate(
+            input_variables=["context", "question"],
+            template="""
+            You are an assistant for question-answering tasks.
+            Only use the following pieces of retrieved context to answer the question.
+            Do not make up information. If the answer is not contained within the provided context, say "I don't know."
+            Use five sentences maximum and keep the answer concise.
+            Please answer in Korean and use respectful language.
+
+            Question: {question}
+            Context: {context}
+            Answer:
+            """
+        )
+
+        rag_chain = (
+            {"context": RunnablePassthrough(), "question": RunnablePassthrough()}
+            | prompt
+            | chat_model
+            | StrOutputParser()
+        )
+
+        handle_user_input(rag_chain, retriever, k_value)
+
+    else:
+        st.info("📌 현재 검색 가능한 데이터가 없습니다. PDF를 업로드하여 데이터를 생성하세요.")
+        st.write("💡 또는 사이드바에서 '기존 데이터 로드' 버튼을 눌러 저장된 데이터를 로드할 수 있습니다.")
+
+if __name__ == "__main__":
+    main()
