@@ -1,0 +1,275 @@
+import os
+import re
+import fitz  # PyMuPDF
+import pandas as pd
+import numpy as np
+from sklearn.cluster import KMeans
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from datetime import datetime
+from langchain_ollama import ChatOllama
+from langchain.schema import HumanMessage
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import sys
+import io
+
+class RedirectText(io.StringIO):
+    def __init__(self, text_widget):
+        super().__init__()
+        self.text_widget = text_widget
+        self.text_widget.config(state=tk.NORMAL)
+
+    def write(self, string):
+        self.text_widget.insert(tk.END, string)
+        self.text_widget.see(tk.END)
+        self.text_widget.update_idletasks()
+        
+    def flush(self):
+        pass
+
+def extract_metadata_from_filename(filename):
+    match = re.match(r"^(\d{6,8})[\- _]?(.*)\.pdf$", filename)  # 6~8자리 숫자 추출 + 구분자 처리
+    if not match:
+        return None, None
+
+    raw_date, title = match.groups()
+    title = title.strip("-_ ")  # 제목에서 구분자 제거
+
+    if len(raw_date) == 6:  # YYMMDD 형식 (예: 230501)
+        year_base = int(raw_date[:2])
+
+        # 80 이상이면 1900년대, 그 이하면 2000년대
+        if year_base >= 80:
+            year = f"19{year_base}"
+        else:
+            year = f"20{year_base}"
+
+        month = raw_date[2:4]
+        day = raw_date[4:]
+    elif len(raw_date) == 8:
+        year = raw_date[:4]
+        month = raw_date[4:6]
+        day = raw_date[6:]
+    else:
+        return None, title
+    
+    formatted_date = f"{year}-{month}-{day}"
+    return formatted_date, title
+
+def extract_text_from_pdf(pdf_path):
+    doc = fitz.open(pdf_path)
+    text = "\n".join([page.get_text("text") for page in doc])
+    return text
+
+def cluster_and_select_key_sentences(text, num_clusters=5):
+    # 1. 문장을 문장 단위로 분할
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=20)
+    sentences = text_splitter.split_text(text)
+
+    # 2. 임베딩 모델을 사용하여 문장 임베딩 생성
+    embedding_model = HuggingFaceEmbeddings(model_name="snunlp/KR-SBERT-V40K-klueNLI-augSTS")
+    sentence_vectors = np.array([embedding_model.embed_query(sentence) for sentence in sentences])
+
+    # 3. K-Means 클러스터링 적용
+    kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
+    kmeans.fit(sentence_vectors)
+    cluster_centers = kmeans.cluster_centers_
+
+    # 4. 각 클러스터에서 중심에 가까운 문장 선택
+    selected_sentences = []
+    for center in cluster_centers:
+        distances = np.linalg.norm(sentence_vectors - center, axis=1)
+        closest_sentence_idx = np.argmin(distances)
+        selected_sentences.append(sentences[closest_sentence_idx])
+
+    return "\n".join(selected_sentences)  # 대표 문장들을 반환
+
+def generate_summary_and_keywords(text):
+    try:
+        llm = ChatOllama(model="EXAONE-3.5-7.8B-Instruct", temperature=0.3)
+
+        # ✅ 클러스터링을 통해 대표 문장 선택
+        key_sentences = cluster_and_select_key_sentences(text, num_clusters=5)
+
+        prompt = f"""
+        문서를 읽고 다음 정보를 생성하세요:
+        1. 요약 (200자 이내, 핵심 내용을 간결하게 서술)
+        2. 주요 키워드 (10개 이내, 단어만 제공, 쉼표로 구분)
+
+        문서 내용:
+        {key_sentences}
+        """
+        
+        response = llm.invoke([HumanMessage(content=prompt)])
+        output_text = response.content.strip()
+
+        # 요약과 키워드 정규식 추출
+        summary_match = re.search(r"(?<=요약:).*", output_text)
+        keywords_match = re.search(r"(?<=키워드:).*", output_text)
+
+        summary = summary_match.group(0).strip() if summary_match else "요약 없음"
+        keywords = keywords_match.group(0).strip() if keywords_match else "키워드 없음"
+
+        # 키워드 쉼표 변환
+        if " " in keywords and "," not in keywords:
+            keywords = ", ".join(keywords.split())
+
+        return summary, keywords
+
+    except Exception as e:
+        return f"LLM 오류 발생: {str(e)}", "키워드 없음"
+
+def update_pdf_metadata(pdf_path, title, subject, keywords, creation_date, output_folder):
+    doc = fitz.open(pdf_path)
+    
+    if doc.is_encrypted:
+        try:
+            doc.authenticate("")  # 암호 없는 경우 해제 시도
+        except Exception:
+            print(f"⚠️ 암호화된 PDF: {pdf_path}, 메타데이터 업데이트 불가")
+            return
+    
+    metadata = doc.metadata
+    metadata["title"] = title  # Title은 문서 제목
+    metadata["subject"] = subject  # Subject는 요약 내용
+    metadata["keywords"] = keywords
+    metadata["creationDate"] = datetime.strptime(creation_date, "%Y-%m-%d").isoformat()
+    
+    output_path = os.path.join(output_folder, os.path.basename(pdf_path))
+    temp_path = output_path + "_temp.pdf"
+    
+    new_doc = fitz.open()
+    for page in doc:
+        new_doc.insert_pdf(doc, from_page=page.number, to_page=page.number)
+    
+    new_doc.set_metadata(metadata)
+    new_doc.save(temp_path, garbage=4, deflate=True, incremental=False)
+    new_doc.close()
+    doc.close()
+    os.replace(temp_path, output_path)
+
+def process_pdf(pdf_path, metadata_list, output_folder):
+    filename = os.path.basename(pdf_path)
+    creation_date, title = extract_metadata_from_filename(filename)
+    if not creation_date:
+        print(f"⚠️ 파일명에서 메타데이터를 추출할 수 없음: {filename}")
+        return
+    
+    text = extract_text_from_pdf(pdf_path)
+    summary, keywords = generate_summary_and_keywords(text)
+    
+    update_pdf_metadata(pdf_path, title, summary, keywords, creation_date, output_folder)
+    print(f"✅ {filename} 메타데이터 업데이트 완료!")
+    
+    metadata_list.append({
+        "Filename": filename,
+        "Title": title,  # Title은 파일명에서 가져온 문서 제목
+        "Subject": summary,  # Subject는 요약 내용
+        "Keywords": keywords,
+        "Creation Date": creation_date
+    })
+
+def process_pdf_folder(input_folder, output_folder):
+    metadata_list = []
+    output_csv = os.path.join(output_folder, "pdf_metadata.csv")
+    try:
+        if os.path.exists(output_csv) and os.path.getsize(output_csv) > 0:
+            existing_df = pd.read_csv(output_csv, sep=",", dtype=str)
+            # 'Filename' 컬럼이 존재하는지 확인하고, 없으면 빈 DataFrame 생성
+            if "Filename" not in existing_df.columns:
+                existing_df = pd.DataFrame()
+        else:
+            existing_df = pd.DataFrame()
+    except (pd.errors.EmptyDataError, pd.errors.ParserError):
+        existing_df = pd.DataFrame()
+    
+    for file in os.listdir(input_folder):
+        if file.endswith(".pdf"):
+            # 기존 데이터에서 중복 제거 (Filename 컬럼이 있는 경우에만)
+            if not existing_df.empty and "Filename" in existing_df.columns:
+                existing_df = existing_df[existing_df["Filename"] != file]
+            process_pdf(os.path.join(input_folder, file), metadata_list, output_folder)
+    
+    new_df = pd.DataFrame(metadata_list)
+    final_df = pd.concat([existing_df, new_df], ignore_index=True) if not existing_df.empty else new_df
+    final_df.to_csv(output_csv, index=False, encoding="utf-8-sig", sep=",")
+    print(f"📄 메타데이터 CSV 저장 완료: {output_csv}")
+    return output_csv
+
+def show_main_window():
+    root = tk.Tk()
+    root.title("PDF 메타데이터 처리 도구")
+    root.geometry("700x400")
+    
+    def select_input_folder():
+        folder = filedialog.askdirectory(title="입력 폴더 선택")
+        if folder:
+            input_folder_var.set(folder)
+    
+    def select_output_folder():
+        folder = filedialog.askdirectory(title="출력 폴더 선택")
+        if folder:
+            output_folder_var.set(folder)
+    
+    def process_files():
+        input_folder = input_folder_var.get()
+        output_folder = output_folder_var.get()
+        
+        if not input_folder or not output_folder:
+            messagebox.showerror("오류", "입력 및 출력 폴더를 모두 선택하세요.")
+            return
+        
+        log_text.delete(1.0, tk.END)  # 로그 초기화
+        process_pdf_folder(input_folder, output_folder)
+    
+    input_folder_var = tk.StringVar()
+    output_folder_var = tk.StringVar()
+    
+    frame = tk.Frame(root)
+    frame.pack(pady=10)
+    
+    tk.Label(frame, text="입력 폴더:").grid(row=0, column=0, padx=5)
+    tk.Entry(frame, textvariable=input_folder_var, width=50).grid(row=0, column=1, padx=5)
+    tk.Button(frame, text="선택", command=select_input_folder).grid(row=0, column=2, padx=5)
+    
+    tk.Label(frame, text="출력 폴더:").grid(row=1, column=0, padx=5)
+    tk.Entry(frame, textvariable=output_folder_var, width=50).grid(row=1, column=1, padx=5)
+    tk.Button(frame, text="선택", command=select_output_folder).grid(row=1, column=2, padx=5)
+    
+    # PDF 처리 시작 버튼을 우측에 배치
+    process_button = tk.Button(frame, text="PDF 처리 시작", command=process_files, 
+                              height=2, width=15, bg="#f0f0f0")
+    process_button.grid(row=0, column=3, rowspan=2, padx=20, pady=5)
+    
+    # 설명 텍스트 영역 추가
+    description_frame1 = tk.Frame(root)
+    description_frame1.pack(fill=tk.X, padx=10, pady=(5, 0))
+    
+    description_label1 = tk.Label(description_frame1, text="📌 프로그램 기능 설명:", anchor="w", font=("Arial", 9, "bold"))
+    description_label1.pack(side=tk.LEFT, anchor="nw")
+    
+    description_frame2 = tk.Frame(root)
+    description_frame2.pack(fill=tk.X, padx=10, pady=(0, 5))
+    
+    description_label2 = tk.Label(description_frame2, text="입력폴더 내 PDF 파일(형태: 날짜(20250316)_보고서.pdf)의 메타데이터(요약, 키워드, 날짜)를 생성하여 출력폴더에 저장", anchor="w", font=("Arial", 9))
+    description_label2.pack(side=tk.LEFT, anchor="nw")
+    
+    # 로그 텍스트 위젯 설정
+    log_text = tk.Text(root, height=10, wrap=tk.WORD)
+    log_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    
+    # 작성자 정보 추가
+    author_label = tk.Label(root, text="© 2025 도시혁신균형실 AI 활성화 연구팀", fg="gray")
+    author_label.pack(side=tk.BOTTOM, pady=5)
+    
+    # 표준 출력을 로그 텍스트 위젯으로 리다이렉션
+    sys.stdout = RedirectText(log_text)
+    
+    root.mainloop()
+    
+    # 프로그램 종료 시 표준 출력 복원
+    sys.stdout = sys.__stdout__
+
+if __name__ == "__main__":
+    show_main_window()
