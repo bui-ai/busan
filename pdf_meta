@@ -62,60 +62,83 @@ def extract_text_from_pdf(pdf_path):
     text = "\n".join([page.get_text("text") for page in doc])
     return text
 
-def cluster_and_select_key_sentences(text, num_clusters=5):
-    # 1. 문장을 문장 단위로 분할
+def cluster_and_select_key_sentences(text):
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=20)
     sentences = text_splitter.split_text(text)
 
-    # 2. 임베딩 모델을 사용하여 문장 임베딩 생성
+    # 문장이 5개 이하라면 클러스터링 없이 전체 문장을 반환
+    if len(sentences) <= 5:
+        return "\n".join(sentences)
+
+    # 문장 수의 30% 또는 최소 3개의 클러스터 사용
+    num_clusters = max(3, min(5, len(sentences) // 3))
+
     embedding_model = HuggingFaceEmbeddings(model_name="snunlp/KR-SBERT-V40K-klueNLI-augSTS")
     sentence_vectors = np.array([embedding_model.embed_query(sentence) for sentence in sentences])
 
-    # 3. K-Means 클러스터링 적용
     kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
     kmeans.fit(sentence_vectors)
     cluster_centers = kmeans.cluster_centers_
 
-    # 4. 각 클러스터에서 중심에 가까운 문장 선택
     selected_sentences = []
     for center in cluster_centers:
         distances = np.linalg.norm(sentence_vectors - center, axis=1)
         closest_sentence_idx = np.argmin(distances)
         selected_sentences.append(sentences[closest_sentence_idx])
 
-    return "\n".join(selected_sentences)  # 대표 문장들을 반환
+    return "\n".join(selected_sentences)
+
 
 def generate_summary_and_keywords(text):
     try:
         llm = ChatOllama(model="EXAONE-3.5-7.8B-Instruct", temperature=0.3)
 
-        # ✅ 클러스터링을 통해 대표 문장 선택
-        key_sentences = cluster_and_select_key_sentences(text, num_clusters=5)
+        key_sentences = cluster_and_select_key_sentences(text)
+        if len(key_sentences) < 50:
+            key_sentences = text[:1000]
 
         prompt = f"""
-        문서를 읽고 다음 정보를 생성하세요:
-        1. 요약 (200자 이내, 핵심 내용을 간결하게 서술)
-        2. 주요 키워드 (10개 이내, 단어만 제공, 쉼표로 구분)
+        다음 문서를 기반으로 아래 형식에 정확히 맞춰 응답하세요:
+
+        요약: (200자 이내로, 핵심 내용을 간결하게 서술)
+        키워드: (10개 이내, 단어만 제공, 쉼표로 구분)        
 
         문서 내용:
         {key_sentences}
         """
-        
+
         response = llm.invoke([HumanMessage(content=prompt)])
         output_text = response.content.strip()
+        print("📥 LLM 응답:", output_text)
 
-        # 요약과 키워드 정규식 추출
-        summary_match = re.search(r"(?<=요약:).*", output_text)
-        keywords_match = re.search(r"(?<=키워드:).*", output_text)
+        # 요약 정규식 1차 시도
+        summary_match = re.search(r"(?:요약|1[.)：:])\s*[-:]?\s*(.+?)(?:\n|키워드|2[.)：:])", output_text, re.DOTALL)
+        keywords_match = re.search(r"(?:키워드|2[.)：:])\s*[-:]?\s*(.+)", output_text)
 
-        summary = summary_match.group(0).strip() if summary_match else "요약 없음"
-        keywords = keywords_match.group(0).strip() if keywords_match else "키워드 없음"
+        summary = summary_match.group(1).strip() if summary_match else ""
+        keywords = keywords_match.group(1).strip() if keywords_match else ""
 
-        # 키워드 쉼표 변환
+        # Fallback 요약
+        if not summary:
+            summary_lines = [line for line in output_text.splitlines() if "요약" in line or "1." in line]
+            if summary_lines:
+                summary = summary_lines[0].split(":", 1)[-1].strip()
+            else:
+                summary = output_text.split("\n")[0][:200].strip()
+
+        # Fallback 키워드
+        if not keywords:
+            keyword_lines = [line for line in output_text.splitlines() if "키워드" in line or "2." in line]
+            if keyword_lines:
+                keywords = keyword_lines[0].split(":", 1)[-1].strip()
+            else:
+                found_words = re.findall(r"\b[가-힣]{2,10}\b", output_text)
+                keywords = ", ".join(found_words[:10])
+
         if " " in keywords and "," not in keywords:
             keywords = ", ".join(keywords.split())
 
-        return summary, keywords
+        return summary[:200], keywords
 
     except Exception as e:
         return f"LLM 오류 발생: {str(e)}", "키워드 없음"
@@ -149,7 +172,8 @@ def update_pdf_metadata(pdf_path, title, subject, keywords, creation_date, outpu
     doc.close()
     os.replace(temp_path, output_path)
 
-def process_pdf(pdf_path, metadata_list, output_folder):
+def process_pdf(pdf_path, output_folder):
+    """개별 PDF 파일을 처리하고 처리 후 바로 CSV 파일에 결과를 기록합니다."""
     filename = os.path.basename(pdf_path)
     creation_date, title = extract_metadata_from_filename(filename)
     if not creation_date:
@@ -162,39 +186,74 @@ def process_pdf(pdf_path, metadata_list, output_folder):
     update_pdf_metadata(pdf_path, title, summary, keywords, creation_date, output_folder)
     print(f"✅ {filename} 메타데이터 업데이트 완료!")
     
-    metadata_list.append({
-        "Filename": filename,
-        "Title": title,  # Title은 파일명에서 가져온 문서 제목
-        "Subject": summary,  # Subject는 요약 내용
-        "Keywords": keywords,
-        "Creation Date": creation_date
-    })
-
-def process_pdf_folder(input_folder, output_folder):
-    metadata_list = []
+    # 파일 하나 처리 후 바로 CSV에 결과 추가
     output_csv = os.path.join(output_folder, "pdf_metadata.csv")
+    
+    # 텍스트 길이 제한 (필요에 따라 조정 가능)
+    text_preview = text[:1000].replace("\n", " ").strip()
+    
+    metadata_item = {
+        "Filename": filename,
+        "Title": title,
+        "Subject": summary,
+        "Keywords": keywords,
+        "Creation Date": creation_date,
+        "Text Preview": text_preview,
+        "Full Text": text  # 전체 텍스트도 저장
+    }
+    
+    # CSV 파일이 있으면 로드하고, 없으면 새로 생성
     try:
         if os.path.exists(output_csv) and os.path.getsize(output_csv) > 0:
-            existing_df = pd.read_csv(output_csv, sep=",", dtype=str)
-            # 'Filename' 컬럼이 존재하는지 확인하고, 없으면 빈 DataFrame 생성
-            if "Filename" not in existing_df.columns:
-                existing_df = pd.DataFrame()
+            df = pd.read_csv(output_csv, sep=",", dtype=str)
+            # 'Filename' 컬럼이 존재하는지 확인
+            if "Filename" not in df.columns:
+                df = pd.DataFrame(columns=["Filename", "Title", "Subject", "Keywords", "Creation Date", "Text Preview", "Full Text"])
         else:
-            existing_df = pd.DataFrame()
+            df = pd.DataFrame(columns=["Filename", "Title", "Subject", "Keywords", "Creation Date", "Text Preview", "Full Text"])
     except (pd.errors.EmptyDataError, pd.errors.ParserError):
-        existing_df = pd.DataFrame()
+        df = pd.DataFrame(columns=["Filename", "Title", "Subject", "Keywords", "Creation Date", "Text Preview", "Full Text"])
+    
+    # 기존 데이터에서 같은 파일명이 있으면 제거
+    df = df[df["Filename"] != filename]
+    
+    # 새 데이터 추가
+    df = pd.concat([df, pd.DataFrame([metadata_item])], ignore_index=True)
+    
+    # CSV 파일 저장 - 파일 크기 관리를 위해 Text Preview만 CSV에 저장하고 Full Text는 별도 파일에 저장하는 옵션
+    csv_df = df.copy()
+    
+    if len(text) > 10000:  # 텍스트가 매우 긴 경우 별도 저장 옵션 (필요에 따라 조정)
+        # 전체 텍스트를 별도의 텍스트 파일로 저장
+        text_folder = os.path.join(output_folder, "extracted_texts")
+        os.makedirs(text_folder, exist_ok=True)
+        text_file_path = os.path.join(text_folder, f"{os.path.splitext(filename)[0]}.txt")
+        
+        with open(text_file_path, "w", encoding="utf-8") as f:
+            f.write(text)
+        
+        # CSV에는 텍스트 미리보기만 저장하고 전체 텍스트는 제외
+        if "Full Text" in csv_df.columns:
+            csv_df.drop(columns=["Full Text"], inplace=True)
+        print(f"긴 텍스트는 별도 파일로 저장됨: {text_file_path}")
+    
+    csv_df.to_csv(output_csv, index=False, encoding="utf-8-sig", sep=",")
+    print(f"📄 {filename}의 메타데이터를 CSV에 저장 완료!")
+    
+    return metadata_item
+
+def process_pdf_folder(input_folder, output_folder):
+    """폴더 내 모든 PDF 파일을 순차적으로 처리합니다."""
+    # CSV 파일 경로
+    output_csv = os.path.join(output_folder, "pdf_metadata.csv")
+    processed_count = 0
     
     for file in os.listdir(input_folder):
         if file.endswith(".pdf"):
-            # 기존 데이터에서 중복 제거 (Filename 컬럼이 있는 경우에만)
-            if not existing_df.empty and "Filename" in existing_df.columns:
-                existing_df = existing_df[existing_df["Filename"] != file]
-            process_pdf(os.path.join(input_folder, file), metadata_list, output_folder)
+            process_pdf(os.path.join(input_folder, file), output_folder)
+            processed_count += 1
     
-    new_df = pd.DataFrame(metadata_list)
-    final_df = pd.concat([existing_df, new_df], ignore_index=True) if not existing_df.empty else new_df
-    final_df.to_csv(output_csv, index=False, encoding="utf-8-sig", sep=",")
-    print(f"📄 메타데이터 CSV 저장 완료: {output_csv}")
+    print(f"📊 총 {processed_count}개의 PDF 파일 처리 완료!")
     return output_csv
 
 def show_main_window():
